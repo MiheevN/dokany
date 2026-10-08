@@ -197,19 +197,36 @@ DokanFreeFCB(__in PDokanVCB Vcb, __in PDokanFCB Fcb) {
   // without the VCB lock. This is because CcPurgeCacheSection may trigger a
   // close of one FileObject from within a cleanup of another (with the same
   // FCB). In that case, there is already a FCB lock held below us on the stack,
-  // making it unsafe to acquire a VCB lock.
-  if (InterlockedDecrement(&Fcb->OpenCount) != 0) {
-    return STATUS_SUCCESS;
+  // making it unsafe to acquire a VCB lock. The FileObject being cleaned up
+  // still holds its own reference then, so such a nested close always sees an
+  // OpenCount of at least 2 and takes this lock-free path.
+  for (;;) {
+    LONG openCount = *(volatile LONG *)&Fcb->OpenCount;
+    ASSERT(openCount > 0);
+    if (openCount <= 1) {
+      break;
+    }
+    if (InterlockedCompareExchange(&Fcb->OpenCount, openCount - 1,
+                                   openCount) == openCount) {
+      return STATUS_SUCCESS;
+    }
   }
 
+  // The last reference is dropped only with the VCB locked. Dropping it before
+  // taking the lock let another thread find this FCB in the table, open and
+  // close it and schedule it for garbage collection while we were still
+  // waiting for the lock; a rename over its name (DokanRenameFcb) or a GC pass
+  // then freed it, and we went on to lock and schedule freed memory. That
+  // showed up as "scheduled an FCB for garbage collection when it is already
+  // scheduled" and ended in bugcheck 0x139 (CORRUPT_LIST_ENTRY) under git,
+  // which closes and renames over the same files from several threads. Here
+  // our reference keeps the FCB alive until we hold the lock, and the code that
+  // increments OpenCount also does so with the VCB locked.
   DokanVCBLockRW(Vcb);
   DokanFCBLockRW(Fcb);
 
-  // Note that the OpenCount could theoretically be nonzero if incremented by
-  // another thread after the early return and before the locking of the VCB.
-  // The code that increments it does so with the VCB locked, so at this point
-  // we are sure.
-  if (Fcb->OpenCount == 0 && !DokanScheduleFcbForGarbageCollection(Vcb, Fcb)) {
+  if (InterlockedDecrement(&Fcb->OpenCount) == 0 &&
+      !DokanScheduleFcbForGarbageCollection(Vcb, Fcb)) {
     // We get here when garbage collection is disabled.
     DokanDeleteFcb(Vcb, Fcb, /*RemoveFromTable=*/!Fcb->ReplacedByRename);
   } else {
